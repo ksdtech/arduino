@@ -23,6 +23,7 @@
 #define BIT_HI 1
 #define BIT_LO 0
 
+// Instance of RFM69OOK library
 RFM69OOK radio;
 
 // Store durations in buffer
@@ -34,65 +35,90 @@ byte s0 = 0;
 byte pos = 0;
 bool restart = true;
 
-// See RFM69 data sheet, section 3.3.2. Bit Rate Setting
+// Setting the RFM69 bitrate
+// See this article: http://www.sevenwatt.com/main/rfm69-ook-rssi-and-optimal-bitrate/
+// We need to detect 200 usec, 400 usec and 600 usec signals
+// By trial and error a bitrate of 8000 bps seems to work.
+// t-bit = 125 usec, t-rssi = 2 * t-bit = 250 usec
+
+// Register values for 8000 bps. See RFM69 data sheet, section 3.3.2. Bit Rate Setting
 // FxOSC = 32000000 (32 MHz)
 // BITRATE = FxOSC / Desired BR
-// So, for desired 8.0kb/s BR, BITRATE = 32000000 / 8000 = 4000 = 0x0FA0
+// So, for desired 8000 bps BR, BITRATE = 32000000 / 8000 = 4000 = 0x0FA0
 #define RF_BITRATEMSB_8000 0x0F
 #define RF_BITRATELSB_8000 0xA0
 
-/* More attempts to be AcuRite-compatible
- * From https://hackaday.io/project/4490-re-purposing-acurite-temperature-sensors/log/14763-making-the-rfm69-receive-acurite-data
- */
+// RFM69 settings to be AcuRite-compatible.  
+// Comments with rfm69_write, RegBitrateSet, RegFrfSet are recommendations from this AcuRite project:
+//   https://hackaday.io/project/4490-re-purposing-acurite-temperature-sensors/log/14763-making-the-rfm69-receive-acurite-data
+// radio.initialize() call in RFM69OOK library already does a lot of the setup work for us.
 void setAcuRiteRx() {
-  // rfm69_write(RegOpMode, RegOpModeStandby);
+  // Go to standby mode.
+  // - rfm69_write(RegOpMode, RegOpModeStandby);
+  // This is set in RFM69OOK library here:
   radio.receiveEnd();
 
-  // rfm69_write(RegDataModul, RegDataModulContinuous | RegDataModulOOK); // Set continuous OOK mode
-  // already set in radio.initialize(), CONFIG[1]
+  // Set continuous OOK mode.
+  // - rfm69_write(RegDataModul, RegDataModulContinuous | RegDataModulOOK); 
+  // This is set in radio.initialize(), CONFIG[1]
 
-  // RegBitrateSet(8000); // 8.0kb/s
-  // in radio.initialize(), CONFIG[2] sets bitrate to 32768 b/s
+  // Set bitrate.
+  // - RegBitrateSet(8000); // 8000 bps
+  // In radio.initialize(), CONFIG[2] sets bitrate to 32768 bps. We reset it here:
   radio.writeReg(REG_BITRATEMSB, RF_BITRATEMSB_8000);
   radio.writeReg(REG_BITRATELSB, RF_BITRATELSB_8000);
 
-  // RegFrfSet(433920000); // fundamental frequency = 433.92MHz (really 433.920044 MHz)
+  // Set receiver frequency
+  // - RegFrfSet(433920000); // fundamental frequency = 433.92 MHz (really 433.920044 MHz)
   radio.setFrequencyMHz(433.9);
 
-  // rfm69_write(RegRxBw, RegRxBwDccFreq4 | RegRxBwOOK50k); // 4% DC cancellation; 50k bandwidth in OOK mode
-  // in radio.initialize(), CONFIG[4] sets RF_RXBW_DCCFREQ_010 and 10.4k bandwitth
+  // Set bandwidth
+  // 4% DC cancellation; 50 KHz bandwidth in OOK mode
+  // - rfm69_write(RegRxBw, RegRxBwDccFreq4 | RegRxBwOOK50k); 
+  // In radio.initialize(), CONFIG[4] sets RF_RXBW_DCCFREQ_010 and 10.4 KHz bandwitth
+  // We adjust the bandwidth here.  The AcuRite has 3 different "channels" (A, B and C).
+  // Not sure what the actual frequencies used are, but 50 KHz bandwdith seems to work for channel A:
   radio.setBandwidth(OOK_BW_50_0);
-  // or radio.setBandwidth(OOK_BW_20_8);
-  // or radio.setBandwidth(OOK_BW_10_4);
 
-  // rfm69_write(RegLna, RegLnaZ200 | RegLnaGainSelect12db); // 200 ohm, -12db
+  // For tighter channels, find actual frequency and try these settings (20.8 or 10.4 KHz):
+  // radio.setBandwidth(OOK_BW_20_8);
+  // radio.setBandwidth(OOK_BW_10_4);
+
+  // Set gain select
+  // rfm69_write(RegLna, RegLnaZ200 | RegLnaGainSelect12db); // 200 ohm, -12 db
   radio.writeReg(REG_LNA, RF_LNA_ZIN_200 | RF_LNA_GAINSELECT_MAXMINUS12);
 
-  // rfm69_write(RegOokPeak, RegOokThreshPeak | RegOokThreshPeakStep0d5 | RegOokThreshPeakDec1c );
-  // See the RFM69 data sheet, section 3.4.12. OOK Demodulator
-  // I guess the above settings mean 0.5 dB decrement, period once per chip
-  // already set in radio.initialize(), CONFIG[5] sets RF_OOKPEAK_THRESHTYPE_PEAK | RF_OOKPEAK_PEAKTHRESHSTEP_000 | RF_OOKPEAK_PEAKTHRESHDEC_000
+  // Set threshold and demodulator control. See the RFM69 data sheet, section 3.4.12. OOK Demodulator
+  // - rfm69_write(RegOokPeak, RegOokThreshPeak | RegOokThreshPeakStep0d5 | RegOokThreshPeakDec1c);
+  // I guess the above settings mean 0.5 dB decrement, period once per chip.
+  // This is already set in radio.initialize(), CONFIG[5] sets RF_OOKPEAK_THRESHTYPE_PEAK | RF_OOKPEAK_PEAKTHRESHSTEP_000 | RF_OOKPEAK_PEAKTHRESHDEC_000
 
-  // If we were to use RF_OOKPEAK_THRESHTYPE_FIXED, then we'd set one of these
+  // If we were to use RF_OOKPEAK_THRESHTYPE_FIXED, then we'd set one of these:
   // radio.setFixedThreshold(30);
   // radio.setFixedThreshold(40);
   // radio.setFixedThreshold(50);
   // radio.setFixedThreshold(55);
   radio.setFixedThreshold(60);
 
+  // Apparently we don't need sensitivity boost
   // radio.setSensitivityBoost(SENSITIVITY_BOOST_HIGH);
 
-  // rfm69_write(RegOpMode, RegOpModeRX);
+  // Parameters all set, go back into operation
+  // - rfm69_write(RegOpMode, RegOpModeRX);
   radio.receiveBegin();
 
-  // rfm69_write(RegAfcFei, RegAfcFeiAfcClear);
+  // Reset automatic frequency correction
+  // - rfm69_write(RegAfcFei, RegAfcFeiAfcClear);
   radio.writeReg(REG_AFCFEI, RF_AFCFEI_AFC_CLEAR);
 }
  
 void setup() {
   Serial.begin(115200);
 
+  // Perform basic RFM69OOK set up
   radio.initialize();
+
+  // Customize set up for AcuRite transmitter
   setAcuRiteRx();
 
   Serial.println(F("start"));
